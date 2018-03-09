@@ -19,6 +19,18 @@ scpi_error_t set_current_ch2(struct scpi_parser_context *context, struct scpi_to
 scpi_error_t get_status_ch1(struct scpi_parser_context *context, struct scpi_token *command);
 scpi_error_t get_status_ch2(struct scpi_parser_context *context, struct scpi_token *command);
 
+/* target voltages/currents for each channel, written to by SCPI commands */
+float target_voltage_ch1 = 0.0;
+float target_voltage_ch2 = 0.0;
+float target_current_ch1 = 0.0;
+float target_current_ch2 = 0.0;
+
+/* measured values for voltage and current for each channel, read by SCPI commands */
+float measured_voltage_ch1 = 0.0;
+float measured_voltage_ch2 = 0.0;
+float measured_current_ch1 = 0.0;
+float measured_current_ch2 = 0.0;
+
 // Flags for controlling long-press
 int prevBtn = -1; // -1 means no previous button
 int currBtn = -1; // -1 means no current button
@@ -46,18 +58,6 @@ int CH1VoltPin    = A4;
 int CH1CurrPin    = A5;
 int CH2VoltPin    = A6;
 int CH2CurrPin    = A7;
-
-//These Values are to be read back to the user.
-float CH1VoltRead  = 0.0;
-float CH1CurrRead  = 0.0;
-float CH2VoltRead  = 0.0;
-float CH2CurrRead  = 0.0;
-
-//Limit Voltage and Current
-float CH1VoltSet  = 0.0;
-float CH1CurrSet  = 0.0;
-float CH2VoltSet  = 0.0;
-float CH2CurrSet  = 0.0;
 
 /* enable flags for each channel, read from and written to by SCPI commands */
 bool enabled_ch1 = false;
@@ -161,18 +161,8 @@ void loop()
   //check for keypad presses
   KeyPad();
 
-
-  //vRef  = readAref();
-
   volt1 = analogRead(A0);
-  volt1 = volt1/1023.0;// - 0.206;
-  //volt1 = volt1/vRef;
-
-  Serial.print("Voltage: ");
-  Serial.print(volt1);
-  Serial.print("\tvRef: ");
-  Serial.println(vRef);
-  delay(500);
+  volt1 = volt1/1023.0;
 
   /* if a complete SCPI command is in the buffer, execute the command and reset the buffer */
   if (serial_input_usb_complete == true) {
@@ -622,14 +612,14 @@ void sendKeypadValue(){
         /*********************/
         if(setChannel == 0){
           if(setCommand == "VOLTAGE")
-            CH1VoltSet = setValue.toFloat();
+            target_voltage_ch1 = setValue.toFloat();
           else if(setCommand == "CURRENT")
-            CH1CurrSet = setValue.toFloat();
+            target_current_ch1 = setValue.toFloat();
         }else if(setChannel == 1){
           if(setCommand == "VOLTAGE")
-            CH1VoltSet = setValue.toFloat();
+            target_voltage_ch1 = setValue.toFloat();
           else if(setCommand == "CURRENT")
-            CH1CurrSet = setValue.toFloat();
+            target_current_ch1 = setValue.toFloat();
         }
 
       }
@@ -705,24 +695,24 @@ void UpdateLCD(){
       lcd.setCursor(3, 0);
       lcd.print("V:");
       lcd.setCursor(5,0);
-      lcd.print(CH1VoltRead, 1);//Display CH1 voltage
+      lcd.print(measured_voltage_ch1, 1);//Display CH1 voltage
 
       lcd.setCursor(10, 0);
       lcd.print("I:");
       lcd.setCursor(12, 0);
-      lcd.print(CH1CurrRead, 1); //Display CH1 Current(I)
+      lcd.print(measured_current_ch1, 1); //Display CH1 Current(I)
 
       lcd.setCursor(0, 1);
       lcd.print("C2");
       lcd.setCursor(3, 1);
       lcd.print("V:");
       lcd.setCursor(5,1);
-      lcd.print(CH2VoltRead, 1);//Display CH2 voltage
+      lcd.print(measured_voltage_ch2, 1);//Display CH2 voltage
 
       lcd.setCursor(10, 1);
       lcd.print("I:");
       lcd.setCursor(12, 1);
-      lcd.print(CH2CurrRead, 1); //Display CH2 Current(I)
+      lcd.print(measured_current_ch2, 1); //Display CH2 Current(I)
 
       lcd_delayf = millis();
     }
@@ -777,8 +767,8 @@ void ReadVoltage(){
   v2 *= 7.263/2.18; //Voltage divider resistors
 
   //Update Voltage Reading Output
-  CH1VoltRead = v1;
-  CH2VoltRead = v2;
+  measured_voltage_ch1 = v1;
+  measured_voltage_ch2 = v2;
 }
 
 /***********************************************
@@ -811,6 +801,6 @@ void ReadCurrent(){
   c2 *= (1000 + 860)/1000; //Voltage Divider
   c2 /= 5;//scale down the 50V/V Gain
 
-  CH1CurrRead = c1;
-  CH2CurrRead = c2;
+  measured_current_ch1 = c1;
+  measured_current_ch2 = c2;
 }
