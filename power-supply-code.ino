@@ -36,6 +36,9 @@ int prevBtn = -1; // -1 means no previous button
 int currBtn = -1; // -1 means no current button
 int currPress = 0; // 0 means there was no press during this loop
 
+//Flag for Relay Init Complete
+int RelayInit = 0; // 0: Initialize, 1: Init Complete
+
 //used to detect unwanted long-hold on buttons
 unsigned long mseci   = millis();
 unsigned long msecf   = millis();
@@ -46,18 +49,54 @@ unsigned long lcd_delay = 0;
 unsigned long last_pressi = millis();
 unsigned long last_pressf = millis();
 unsigned long last_press  = 0;
+unsigned long relay_delayi = millis();
+unsigned long relay_delayf = millis();
+unsigned long relay_delay  = 0;
+unsigned long ch1_pwm_delayi = millis();
+unsigned long ch1_pwm_delayf = millis();
+unsigned long ch1_pwm_delay  = 0;
+unsigned long ch2_pwm_delayi = millis();
+unsigned long ch2_pwm_delayf = millis();
+unsigned long ch2_pwm_delay  = 0;
 
 String ErrorReport = "";    // Display any errors to LCD
+String ErrorReport2 = "";
 String CommandString = "";  // Used to hold the string to send to SCPI
 String setCommand    = "VOLTAGE";  // Set Voltage, Current
 String setValue      = ""; //Set the value of voltage or current
 int setChannel    = 1; //Select channel 1 or 2
 int keypadDone    = 1; //Tell the system if user is entering data 1:nothing 0:entering
 
+//Read Voltage And Current
 int CH1VoltPin    = A4;
 int CH1CurrPin    = A5;
 int CH2VoltPin    = A6;
 int CH2CurrPin    = A7;
+//Set Voltage And Current
+int CH1SetPin     = 13; //PWM Pin Needed
+int CH2SetPin     = 6; //PWM Pin Needed
+int CH1RelayLoad  = 22;
+int CH1RelayVolt  = 24;
+int CH2RelayLoad  = 23;
+int CH2RelayVolt  = 25;
+
+//These Values are to be read back to the user.
+float CH1VoltRead  = 0.0;
+float CH1CurrRead  = 0.0;
+float CH2VoltRead  = 0.0;
+float CH2CurrRead  = 0.0;
+
+//Limit Voltage and Current
+float CH1VoltSet  = 0.0;
+float CH1CurrSet  = 1.56;
+float CH2VoltSet  = 0.0;
+float CH2CurrSet  = 1.561;
+int   CH1EN       = 0; // 0 Disabled channel, 1 Enabled CHANNEL
+int   CH2EN       = 0;
+int   CH1VoltPWM  = 255;
+int   CH2VoltPWM  = 255;
+float CH1PWMScale = 0.0; //1.0: 100% 0: 0%
+float CH2PWMScale = 0.0;
 
 /* enable flags for each channel, read from and written to by SCPI commands */
 bool enabled_ch1 = false;
@@ -74,20 +113,17 @@ int col[4] = {2, 3, 4, 5};
 
 //these keys will represent what is being pressed on the keypad
 char key[4][4] = { {'1', '2', '3', 'C'},
-                   {'4', '5', '6', 'V'},
+                   {'4', '5', '6', 'N'},
                    {'7', '8', '9', 'I'},
-                   {'0', '.', 'R', 'E'} };
+                   {'0', '.', 'E', 'V'} };
 
 int shutdown_cmd = 0; //Command to break the main loop before turning off system.
 
-float volt1 = 0.0;
 float vRef = 0.0;
 
 void setup()
 {
-  pinMode(A0, INPUT);
-  analogReference(EXTERNAL);
-  volt1 = analogRead(A0);
+//  analogReference(EXTERNAL);
 
   /* declared pointers for the heads of the source and measure SCPI command trees */
   struct scpi_command *source;
@@ -132,17 +168,30 @@ void setup()
   /* reserve 256 bytes for the SCPI command input buffer (well above requirements) */
   serial_input_usb.reserve(256);
 
-  /*
-   * Next, we set our outputs to some default value.
-   */
-  analogWrite(3, 0); //Are these Current and Voltage Limit Pins?
-  analogWrite(5, 0);
-
   Serial.begin(9600);
 
   //Setup LCD Screen
   lcd.begin(16, 2);
-  lcd.setCursor(0, 1);
+
+  // Setup channel 1 and 2 Relays
+  pinMode(CH1RelayLoad, OUTPUT);
+  pinMode(CH1RelayVolt, OUTPUT);
+  pinMode(CH2RelayLoad, OUTPUT);
+  pinMode(CH2RelayVolt, OUTPUT);
+  pinMode(CH1SetPin, OUTPUT);
+  pinMode(CH2SetPin, OUTPUT);
+
+  relay_delayi = millis();  // begin counting
+  digitalWrite(CH1RelayLoad, LOW); //Start with relay opened
+  digitalWrite(CH1RelayVolt, LOW);
+  digitalWrite(CH2RelayLoad, LOW);
+  digitalWrite(CH2RelayVolt, LOW);
+
+  //Set Voltage and Current Read Inputs
+  pinMode(CH1VoltPin, INPUT); //Voltage (V) Channel (1) Read
+  pinMode(CH1CurrPin, INPUT); //Current (I) Channel (1) Read
+  pinMode(CH2VoltPin, INPUT); //Voltage (V) Channel (2) Read
+  pinMode(CH2CurrPin, INPUT); //Current (I) Channel (2) Read
 
   //Set the row to INPUT with the internal pull-up resistors
   for(int i = 0; i < 4; i++)
@@ -158,11 +207,24 @@ void loop()
   char line_buffer[256];
   unsigned char read_length;
 
-  //check for keypad presses
-  KeyPad();
+  relay_delayf = millis();
+  relay_delay  = relay_delayf - relay_delayi;
 
-  volt1 = analogRead(A0);
-  volt1 = volt1/1023.0;
+  // Wait about 100ms to allow inductors and capacitors
+  // to charge. This will lower the "drive" of the buck converter.
+  if(relay_delay >= 100 && RelayInit == 0){
+    RelayInit = 1;
+
+    if(CH1EN){
+      digitalWrite(CH1RelayLoad, LOW);
+      digitalWrite(CH1RelayVolt, LOW);
+    }
+
+    if(CH2EN){
+      digitalWrite(CH2RelayLoad, LOW);
+      digitalWrite(CH2RelayVolt, LOW);
+    }
+  }
 
   /* if a complete SCPI command is in the buffer, execute the command and reset the buffer */
   if (serial_input_usb_complete == true) {
@@ -180,6 +242,8 @@ void loop()
   //Used for LCD Display and Keypad Readback
   ReadVoltage();
   ReadCurrent();
+  AdjustVoltCurr();
+  RelayUpdate();
   KeyPad();
   UpdateLCD();
 }
@@ -265,7 +329,7 @@ scpi_error_t get_current_ch2(struct scpi_parser_context *context, struct scpi_to
 /* returns the state of channel 1 */
 scpi_error_t get_status_ch1(struct scpi_parser_context *context, struct scpi_token *command)
 {
-    if (enabled_ch1)
+    if (CH1EN)
     {
         Serial.println("true");
     }
@@ -281,7 +345,7 @@ scpi_error_t get_status_ch1(struct scpi_parser_context *context, struct scpi_tok
 /* returns the state of channel 2 */
 scpi_error_t get_status_ch2(struct scpi_parser_context *context, struct scpi_token *command)
 {
-    if (enabled_ch2)
+    if (CH2EN)
     {
         Serial.println("true");
     }
@@ -442,8 +506,8 @@ scpi_error_t set_current_ch2(struct scpi_parser_context *context, struct scpi_to
 	return SCPI_SUCCESS;
 }
 
-float readAref (void) {
-  float volt;
+//float readAref (void) {
+//  float volt;
 /*
 #if defined (__AVR_ATmega8__)
 #elif defined (__AVR_ATmega168__)
@@ -451,7 +515,7 @@ float readAref (void) {
 #elif defined (__AVR_ATmega168P__)
 #elif defined (__AVR_ATmega328__)
 #elif defined (__AVR_ATmega328P__)*/
-
+/*
   // set reference to AREF, and mux to read the internal 1.1V
   // REFS1 = 0, REFS0 = 0, MUX3..0 = 1110
   ADMUX = _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
@@ -481,12 +545,12 @@ float readAref (void) {
 
 
   // Try to return to normal.
-  analogReference(EXTERNAL);
-  analogRead(A0);            // the mux is set, throw away ADC value
-  delay(20);                 // wait for voltages to become stable
+//  analogReference(EXTERNAL);
+//  analogRead(A0);            // the mux is set, throw away ADC value
+//  delay(20);                 // wait for voltages to become stable
 
-  return volt;
-}
+//  return volt;
+//}*/
 
 
 void KeyPad(){
@@ -561,6 +625,25 @@ void printKeyPad(char k){
     setCommand = "CHANNEL";
   }else if(k == 'N'){
     Serial.println("Key: Channel Enable/Disable");
+
+    if(setChannel == 1){
+        if(CH1EN)
+          CH1EN = 0;
+        else
+          CH1EN = 1;
+    }else{
+        if(CH2EN)
+          CH2EN = 0;
+        else
+          CH2EN = 1;
+    }
+
+    //Clear any error reports from over current draw
+    ErrorReport = "";
+    ErrorReport2 = "";
+    setValue = "";
+    keypadDone = 1;
+
   }else if(k == 'V'){
     Serial.println("Key: Set Voltage");
 
@@ -582,6 +665,7 @@ void printKeyPad(char k){
 
     setValue = "";  //Clear the command string
     keypadDone = 1;
+    SetVoltCurr();
   }else{
     // Only use 4 keys, such as 12.50
     if(setValue.length() < 4)
@@ -610,16 +694,17 @@ void sendKeypadValue(){
         /*********************/
         /* SET COMMAND VALUE */
         /*********************/
-        if(setChannel == 0){
+        if(setChannel == 1){
           if(setCommand == "VOLTAGE")
-            target_voltage_ch1 = setValue.toFloat();
+            CH1VoltSet = setValue.toFloat();
           else if(setCommand == "CURRENT")
-            target_current_ch1 = setValue.toFloat();
-        }else if(setChannel == 1){
-          if(setCommand == "VOLTAGE")
-            target_voltage_ch1 = setValue.toFloat();
-          else if(setCommand == "CURRENT")
-            target_current_ch1 = setValue.toFloat();
+            CH1CurrSet = setValue.toFloat();
+
+        }else if(setChannel == 2){
+          if(setCommand == "VOLTAGE1")
+            CH1VoltSet = setValue.toFloat();
+          else if(setCommand == "CURRENT1")
+            CH1CurrSet = setValue.toFloat();
         }
 
       }
@@ -666,55 +751,66 @@ int checkRangeCommand(){
  *  well as what the channels read.
  ************************************************/
 void UpdateLCD(){
-  String lcdText = "";
   lcd_delayi = millis();
 
   //calculate the time diff. from last LCD update
   //lcd_delayi is a larger number than lcd_delayf
   lcd_delay = lcd_delayi - lcd_delayf;
 
-  if(lcd_delay > 10){
-    clearLCD();
+  if(lcd_delay > 300){
 
-    if(keypadDone == 0){
-
-      //Show which option
+    if(ErrorReport != "" && lcd_delay > 500){
+      clearLCD();
       lcd.setCursor(0, 0);
-      lcd.print(setCommand);
-      lcd.setCursor(7, 0);
-      lcd.print(":");
-      //display pressed value
-      lcd.setCursor(8, 0);
-      lcd.print(setValue);
-
-    }else{
-      lcdText = String(lcd_delay);
-
-      lcd.setCursor(0, 0);
-      lcd.print("C1");
-      lcd.setCursor(3, 0);
-      lcd.print("V:");
-      lcd.setCursor(5,0);
-      lcd.print(measured_voltage_ch1, 1);//Display CH1 voltage
-
-      lcd.setCursor(10, 0);
-      lcd.print("I:");
-      lcd.setCursor(12, 0);
-      lcd.print(measured_current_ch1, 1); //Display CH1 Current(I)
-
+      lcd.print(ErrorReport);
       lcd.setCursor(0, 1);
-      lcd.print("C2");
-      lcd.setCursor(3, 1);
-      lcd.print("V:");
-      lcd.setCursor(5,1);
-      lcd.print(measured_voltage_ch2, 1);//Display CH2 voltage
-
-      lcd.setCursor(10, 1);
-      lcd.print("I:");
-      lcd.setCursor(12, 1);
-      lcd.print(measured_current_ch2, 1); //Display CH2 Current(I)
+      lcd.print(ErrorReport2);
 
       lcd_delayf = millis();
+    }else{
+
+        if(keypadDone == 0){
+          clearLCD();
+
+          //Show which option
+          lcd.setCursor(0, 0);
+          lcd.print(setCommand);
+          lcd.setCursor(7, 0);
+          lcd.print(":");
+          //display pressed value
+          lcd.setCursor(8, 0);
+          lcd.print(setValue);
+
+          lcd_delayf = millis();
+        }else if(lcd_delay > 500){
+          clearLCD();
+
+          lcd.setCursor(0, 0);
+          lcd.print("C1");
+          lcd.setCursor(3, 0);
+          lcd.print("V:");
+          lcd.setCursor(5,0);
+          lcd.print(CH1VoltRead, 1);//Display CH1 voltage
+
+          lcd.setCursor(10, 0);
+          lcd.print("I:");
+          lcd.setCursor(12, 0);
+          lcd.print(CH1CurrRead, 2); //Display CH1 Current(I)
+
+          lcd.setCursor(0, 1);
+          lcd.print("C2");
+          lcd.setCursor(3, 1);
+          lcd.print("V:");
+          lcd.setCursor(5,1);
+          lcd.print(CH2VoltRead, 1);//Display CH2 voltage
+
+          lcd.setCursor(10, 1);
+          lcd.print("I:");
+          lcd.setCursor(12, 1);
+          lcd.print(CH2CurrRead, 2); //Display CH2 Current(I)
+
+          lcd_delayf = millis();
+        }
     }
   }
 }
@@ -746,29 +842,36 @@ void clearLCD(){
 void ReadVoltage(){
   float v1  = 0.0, v2 = 0.0;
 
-  for(int i = 0; i < 10; i++){
-    v1 += analogRead(CH1VoltPin);
-    //v2 += analogRead(CH2VoltPin);
-  }
+  if(CH1EN){
+    for(int i = 0; i < 10; i++){
+      v1 += analogRead(CH1VoltPin);
+    }
 
-  v1 /= 10; //Get the average of 10 reads
-  v1 /= 1023; //Convert to float
-  v1 *= 5; //Reading with a 5V reference
-  v1 *= 7.263/2.18; //Voltage divider resistors
+    v1 /= 10; //Get the average of 10 reads
+    v1 /= 1023; //Convert to float
+    v1 *= 5; //Reading with a 5V reference
+    v1 *= 3.55; //Voltage divider resistors
+    v1 *= 0.99; //Scale the voltage read to fix output
 
-  for(int i = 0; i < 10; i++){
-    v2 += analogRead(CH1VoltPin);
-    //v2 += analogRead(CH2VoltPin);
-  }
+    CH1VoltRead = v1;
+  }else
+    CH1VoltRead = 0.0;
 
-  v2 /= 10; //Get the average of 10 reads
-  v2 /= 1023; //Convert to float
-  v2 *= 5; //Reading with a 5V reference
-  v2 *= 7.263/2.18; //Voltage divider resistors
+  if(CH2EN){
+    for(int i = 0; i < 10; i++){
+      v2 += analogRead(CH2VoltPin);
+    }
+    v2 /= 10; //Get the average of 10 reads
+    v2 /= 1023; //Convert to float
+    v2 *= 5; //Reading with a 5V reference
+    v2 *= 3.55; //Voltage divider resistors
+    v2 *= 0.99; //Scale the voltage read to fix output
 
-  //Update Voltage Reading Output
-  measured_voltage_ch1 = v1;
-  measured_voltage_ch2 = v2;
+    //Update Voltage Reading Output
+    CH2VoltRead = v2;
+  }else
+    CH2VoltRead = 0.0;
+
 }
 
 /***********************************************
@@ -781,26 +884,116 @@ void ReadVoltage(){
 void ReadCurrent(){
   float c1  = 0.0, c2 = 0.0;
 
-  for(int i = 0; i < 10; i++){
-    c1 += analogRead(CH1CurrPin);
+  if(CH1EN){
+    for(int i = 0; i < 10; i++){
+      c1 += analogRead(CH1CurrPin);
+    }
+
+    //c1 = analogRead(CH1CurrPin);
+    c1 /= 10; //Get the average of 10 reads
+    c1 /= 1023; //Convert from Analog
+    c1 *= 5; //Reading with a 5V reference
+    c1 *= 1.845; ///= 0.542; // *= (1000 + 860)/1000; //Voltage Divider
+    c1 /= 5.3;//scale down the 50V/V Gain
+
+    CH1CurrRead = c1;
+  }else
+    CH1CurrRead = 0.0;
+
+  if(CH2EN){
+    for(int i = 0; i < 10; i++){
+      c2 += analogRead(CH2CurrPin);
+    }
+    c2 /= 10; //Get the average of 10 reads
+    c2 /= 1023; //Convert from Analog
+    c2 *= 5; //Reading with a 5V reference
+    c2 *= 1.845; ///= 0.542; //*= (1000 + 860)/1000; //Voltage Divider
+    c2 /= 5.3;//scale down the 50V/V Gain
+
+    CH2CurrRead = c2;
+  }else
+    CH2CurrRead = 0.0;
+
+  if( ( c1 >= 1.56 || c1 >  CH1CurrSet) && CH1EN == 1){
+    CH1EN = 0;
+    digitalWrite(CH1RelayLoad, LOW);
+    digitalWrite(CH1RelayVolt, LOW);
+
+    ErrorReport = "Max Current " + String(c1);
+    ErrorReport2 = "Channel 1";
   }
 
-  c1 /= 10; //Get the average of 10 reads
-  c1 /= 1023; //Convert from Analog
-  c1 *= 5; //Reading with a 5V reference
-  c1 *= (1000 + 860)/1000; //Voltage Divider
-  c1 /= 5;//scale down the 50V/V Gain
+  if( ( c2 >= 1.56 || c2 > CH2CurrSet) && CH2EN == 1){
+    CH2EN = 0;
+    digitalWrite(CH2RelayLoad, LOW);
+    digitalWrite(CH2RelayVolt, LOW);
 
-  for(int i = 0; i < 10; i++){
-    c2 += analogRead(CH1CurrPin);
+    ErrorReport = "Max Current "+String(c2);
+    ErrorReport2 = "Channel 2";
+  }
+}
+
+void RelayUpdate(){
+  if(CH1EN){
+    digitalWrite(CH1RelayLoad, HIGH);
+    digitalWrite(CH1RelayVolt, HIGH);
+  }else{
+    digitalWrite(CH1RelayLoad, LOW);
+    digitalWrite(CH1RelayVolt, LOW);
   }
 
-  c2 /= 10; //Get the average of 10 reads
-  c2 /= 1023; //Convert from Analog
-  c2 *= 5; //Reading with a 5V reference
-  c2 *= (1000 + 860)/1000; //Voltage Divider
-  c2 /= 5;//scale down the 50V/V Gain
+  if(CH2EN){
+    digitalWrite(CH2RelayLoad, HIGH);
+    digitalWrite(CH2RelayVolt, HIGH);
+  }else{
+    digitalWrite(CH2RelayLoad, LOW);
+    digitalWrite(CH2RelayVolt, LOW);
+  }
+}
 
-  measured_current_ch1 = c1;
-  measured_current_ch2 = c2;
+void AdjustVoltCurr(){
+  float CH1VoltDiff = CH1VoltSet - CH1VoltRead;
+  float CH2VoltDiff = CH2VoltSet - CH1VoltRead;
+  float CH1CurrDiff = CH1CurrSet - CH1CurrRead;
+  float CH2CurrDiff = CH2CurrSet - CH2CurrRead;
+  ch1_pwm_delayi    = millis();
+  ch2_pwm_delayi    = millis();
+
+  ch1_pwm_delay = ch1_pwm_delayf - ch1_pwm_delayi;
+  ch2_pwm_delay = ch2_pwm_delayf - ch2_pwm_delayi;
+
+  if(CH1EN && ch1_pwm_delay >= 100){
+    if(CH1VoltDiff < -0.2 && CH1VoltPWM < 255)
+      CH1VoltPWM += 1; //CH1PWMScale += 0.01;
+    else if(CH1VoltDiff > 0.2 && CH1VoltPWM > 0)
+      CH1VoltPWM -= 1; //CH1PWMScale -= 0.01;
+
+    ch1_pwm_delayf = millis();
+    analogWrite(CH1SetPin, CH1VoltPWM);
+  }
+
+  if(CH2EN && ch2_pwm_delay >= 100){
+    if(CH2VoltDiff < -0.2 && CH2VoltPWM < 255)
+      CH2VoltPWM += 1;
+    else if(CH2VoltDiff > 0.2 && CH2VoltPWM > 0)
+      CH2VoltPWM -= 1;
+
+    ch1_pwm_delayf = millis();
+    analogWrite(CH2SetPin, CH2VoltPWM);
+  }
+}
+
+void SetVoltCurr(){
+  if(CH1EN){
+    CH1VoltPWM = (255/2)*CH1VoltSet/14;
+    analogWrite(CH1SetPin, CH1VoltPWM);
+  }else
+    analogWrite(CH1SetPin, 255);
+
+
+  if(CH2EN){
+    CH2VoltPWM = (255/2)*CH2VoltSet/14;
+    analogWrite(CH2SetPin, CH2VoltPWM);
+  }else
+    analogWrite(CH2SetPin, 255);
 }
