@@ -6,17 +6,38 @@ LiquidCrystal lcd(7,8,9,10,11,12);
 
 struct scpi_parser_context ctx;
 
-scpi_error_t identify(struct scpi_parser_context* context, struct scpi_token* command);
-scpi_error_t get_voltage(struct scpi_parser_context* context, struct scpi_token* command);
-scpi_error_t get_voltage_2(struct scpi_parser_context* context, struct scpi_token* command);
-scpi_error_t get_voltage_3(struct scpi_parser_context* context, struct scpi_token* command);
-scpi_error_t set_voltage(struct scpi_parser_context* context, struct scpi_token* command);
-scpi_error_t set_voltage_2(struct scpi_parser_context* context, struct scpi_token* command);
+/* forward declarations of all functions called by SCPI commands */
+scpi_error_t identify(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_voltage_ch1(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_voltage_ch2(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_current_ch1(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_current_ch2(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t set_voltage_ch1(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t set_voltage_ch2(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t set_current_ch1(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t set_current_ch2(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_status_ch1(struct scpi_parser_context *context, struct scpi_token *command);
+scpi_error_t get_status_ch2(struct scpi_parser_context *context, struct scpi_token *command);
+
+/* target voltages/currents for each channel, written to by SCPI commands */
+float target_voltage_ch1 = 0.0;
+float target_voltage_ch2 = 0.0;
+float target_current_ch1 = 0.0;
+float target_current_ch2 = 0.0;
+
+/* measured values for voltage and current for each channel, read by SCPI commands */
+float measured_voltage_ch1 = 0.0;
+float measured_voltage_ch2 = 0.0;
+float measured_current_ch1 = 0.0;
+float measured_current_ch2 = 0.0;
 
 // Flags for controlling long-press
 int prevBtn = -1; // -1 means no previous button
 int currBtn = -1; // -1 means no current button
 int currPress = 0; // 0 means there was no press during this loop
+
+//Flag for Relay Init Complete
+int RelayInit = 0; // 0: Initialize, 1: Init Complete
 
 //used to detect unwanted long-hold on buttons
 unsigned long mseci   = millis();
@@ -31,21 +52,33 @@ unsigned long last_press  = 0;
 unsigned long relay_delayi = millis();
 unsigned long relay_delayf = millis();
 unsigned long relay_delay  = 0;
+unsigned long ch1_pwm_delayi = millis();
+unsigned long ch1_pwm_delayf = millis();
+unsigned long ch1_pwm_delay  = 0;
+unsigned long ch2_pwm_delayi = millis();
+unsigned long ch2_pwm_delayf = millis();
+unsigned long ch2_pwm_delay  = 0;
 
 String ErrorReport = "";    // Display any errors to LCD
+String ErrorReport2 = "";
 String CommandString = "";  // Used to hold the string to send to SCPI
 String setCommand    = "VOLTAGE";  // Set Voltage, Current
 String setValue      = ""; //Set the value of voltage or current
 int setChannel    = 1; //Select channel 1 or 2
 int keypadDone    = 1; //Tell the system if user is entering data 1:nothing 0:entering
 
-// The Pins used for the channels
+//Read Voltage And Current
 int CH1VoltPin    = A4;
 int CH1CurrPin    = A5;
 int CH2VoltPin    = A6;
 int CH2CurrPin    = A7;
-int CH1Relay      = 22;
-int CH2Relay      = 23;
+//Set Voltage And Current
+int CH1SetPin     = 13; //PWM Pin Needed
+int CH2SetPin     = 6; //PWM Pin Needed
+int CH1RelayLoad  = 22;
+int CH1RelayVolt  = 24;
+int CH2RelayLoad  = 23;
+int CH2RelayVolt  = 25;
 
 //These Values are to be read back to the user.
 float CH1VoltRead  = 0.0;
@@ -55,81 +88,110 @@ float CH2CurrRead  = 0.0;
 
 //Limit Voltage and Current
 float CH1VoltSet  = 0.0;
-float CH1CurrSet  = 0.0;
+float CH1CurrSet  = 1.56;
 float CH2VoltSet  = 0.0;
-float CH2CurrSet  = 0.0;
+float CH2CurrSet  = 1.561;
 int   CH1EN       = 0; // 0 Disabled channel, 1 Enabled CHANNEL
 int   CH2EN       = 0;
+int   CH1VoltPWM  = 255;
+int   CH2VoltPWM  = 255;
+float CH1PWMScale = 0.0; //1.0: 100% 0: 0%
+float CH2PWMScale = 0.0;
+
+/* enable flags for each channel, read from and written to by SCPI commands */
+bool enabled_ch1 = false;
+bool enabled_ch2 = true;
+
+/* storage space for partial incoming SCPI commands, and flag for a complete command */
+String serial_input_usb = "";
+bool serial_input_usb_complete = false;
+String serial_input_bt = "";
+bool serial_input_bt_complete = false;
 
 int row[4] = {A0, A1, A2, A3};
 int col[4] = {2, 3, 4, 5};
 
 //these keys will represent what is being pressed on the keypad
 char key[4][4] = { {'1', '2', '3', 'C'},
-                   {'4', '5', '6', 'V'},
+                   {'4', '5', '6', 'N'},
                    {'7', '8', '9', 'I'},
-                   {'0', '.', 'N', 'E'} };
+                   {'0', '.', 'E', 'V'} };
 
 int shutdown_cmd = 0; //Command to break the main loop before turning off system.
 
-float volt1 = 0.0;
 float vRef = 0.0;
 
 void setup()
 {
-  pinMode(A0, INPUT);
-  analogReference(EXTERNAL);
-  volt1 = analogRead(A0);
+//  analogReference(EXTERNAL);
 
+  /* declared pointers for the heads of the source and measure SCPI command trees */
+  struct scpi_command *source;
+  struct scpi_command *measure;
+  struct scpi_command *state;
 
-  struct scpi_command* source;
-  struct scpi_command* measure;
-  //struct scpi_command* sys;
-
-  /* First, initialise the parser. */
+  /* initialize the used SCPI library */
   scpi_init(&ctx);
 
-  /*
-   * After initialising the parser, we set up the command tree.  Ours is
-   *
-   *  *IDN?         -> identify
-   *  :SOURCE
-   *    :VOLTage    -> set_voltage
-   *    :VOLTage1   -> set_voltage_2
-   *  :MEASure
-   *    :VOLTage?   -> get_voltage
-   *    :VOLTage1?  -> get_voltage_2
-   *    :VOLTage2?  -> get_voltage_3
-   */
+  /* register the "identify" SCPI command
+   * format is (parent command, command level, long name, name length, short name, name length, function)
+   *     parent command: the command above this one in the command tree, called as PARENT:CHILD
+   *     command level: whether this command is added at the same level as the parent, or as a child
+   *     long name: the long form of the SCPI command name
+   *     name length: the number of characters in the long name (to avoid line ending oddities)
+   *     short name: the short form of the SCPI command name (can be identical to long name)
+   *     name length: the number of characters in the short name
+   *     function: the name of the function to call when receiving this SCPI command */
   scpi_register_command(ctx.command_tree, SCPI_CL_SAMELEVEL, "*IDN?", 5, "*IDN?", 5, identify);
-  scpi_register_command(ctx.command_tree, SCPI_CL_SAMELEVEL, "OFF", 3, "OFF", 3, shutdown_system);
 
-  source  = scpi_register_command(ctx.command_tree, SCPI_CL_CHILD, "SOURCE", 6, "SOUR", 4, NULL);
+  /* register the head of the "source" and "measure" SCPI command trees */
+  source = scpi_register_command(ctx.command_tree, SCPI_CL_CHILD, "SOURCE", 6, "SOUR", 4, NULL);
   measure = scpi_register_command(ctx.command_tree, SCPI_CL_CHILD, "MEASURE", 7, "MEAS", 4, NULL);
-  //sys     = scpi_register_command(ctx.command_tree, SCPI_CL_CHILD, "SYSTEM", 5, "SYST", 3, NULL);
+  state = scpi_register_command(ctx.command_tree, SCPI_CL_CHILD, "STATUS", 6, "STAT", 4, NULL);
 
-  scpi_register_command(source, SCPI_CL_CHILD, "VOLTAGE", 7, "VOLT", 4, set_voltage);
-  scpi_register_command(source, SCPI_CL_CHILD, "VOLTAGE1", 8, "VOLT1", 5, set_voltage_2);
+  /* register all members of the "source" command tree (voltage/current for each channel) */
+  scpi_register_command(source, SCPI_CL_CHILD, "VOLTAGE1", 8, "VOLT1", 5, set_voltage_ch1);
+  scpi_register_command(source, SCPI_CL_CHILD, "VOLTAGE2", 8, "VOLT2", 5, set_voltage_ch2);
+  scpi_register_command(source, SCPI_CL_CHILD, "CURRENT1", 8, "CURR1", 5, set_current_ch1);
+  scpi_register_command(source, SCPI_CL_CHILD, "CURRENT2", 8, "CURR2", 5, set_current_ch2);
 
-  scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE?", 8, "VOLT?", 5, get_voltage);
-  scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE1?", 9, "VOLT1?", 6, get_voltage_2);
-  scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE2?", 9, "VOLT2?", 6, get_voltage_3);
+  /* register all members of the "measure" command tree (voltage/current for each channel) */
+  scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE1?", 9, "VOLT1?", 6, get_voltage_ch1);
+  scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE2?", 9, "VOLT2?", 6, get_voltage_ch2);
+  scpi_register_command(measure, SCPI_CL_CHILD, "CURRENT1?", 9, "CURR1?", 6, get_current_ch1);
+  scpi_register_command(measure, SCPI_CL_CHILD, "CURRENT2?", 9, "CURR2?", 6, get_current_ch2);
+
+  /* register all members of the "state" command tree */
+  scpi_register_command(state, SCPI_CL_CHILD, "CHANNEL1?", 9, "CH1?", 4, get_status_ch1);
+  scpi_register_command(state, SCPI_CL_CHILD, "CHANNEL2?", 9, "CH2?", 4, get_status_ch2);
+
+  /* reserve 256 bytes for the SCPI command input buffer (well above requirements) */
+  serial_input_usb.reserve(256);
 
   Serial.begin(9600);
 
   //Setup LCD Screen
   lcd.begin(16, 2);
-  lcd.setCursor(0, 1);
 
   // Setup channel 1 and 2 Relays
-  pinMode(CH1Relay, OUTPUT);
-  pinMode(CH2Relay, OUTPUT);
-  relay_delayi = millis();  // begin counting
-  digitalWrite(CH1Relay, HIGH); //Start with relay opened
-  digitalWrite(CH2Relay, HIGH);
+  pinMode(CH1RelayLoad, OUTPUT);
+  pinMode(CH1RelayVolt, OUTPUT);
+  pinMode(CH2RelayLoad, OUTPUT);
+  pinMode(CH2RelayVolt, OUTPUT);
+  pinMode(CH1SetPin, OUTPUT);
+  pinMode(CH2SetPin, OUTPUT);
 
-  pinMode(A4, INPUT); //Voltage (V) Channel (1) Read
-  pinMode(A5, INPUT); //Current (I) Channel (1) Read
+  relay_delayi = millis();  // begin counting
+  digitalWrite(CH1RelayLoad, LOW); //Start with relay opened
+  digitalWrite(CH1RelayVolt, LOW);
+  digitalWrite(CH2RelayLoad, LOW);
+  digitalWrite(CH2RelayVolt, LOW);
+
+  //Set Voltage and Current Read Inputs
+  pinMode(CH1VoltPin, INPUT); //Voltage (V) Channel (1) Read
+  pinMode(CH1CurrPin, INPUT); //Current (I) Channel (1) Read
+  pinMode(CH2VoltPin, INPUT); //Voltage (V) Channel (2) Read
+  pinMode(CH2CurrPin, INPUT); //Current (I) Channel (2) Read
 
   //Set the row to INPUT with the internal pull-up resistors
   for(int i = 0; i < 4; i++)
@@ -145,210 +207,307 @@ void loop()
   char line_buffer[256];
   unsigned char read_length;
 
-  //check for keypad presses
-  KeyPad();
-
-  //vRef  = readAref();
-
-  volt1 = analogRead(A0);
-  volt1 = volt1/1023.0;// - 0.206;
-  //volt1 = volt1/vRef;
-
-  Serial.print("Voltage: ");
-  Serial.print(volt1);
-  Serial.print("\tvRef: ");
-  Serial.println(vRef);
-  delay(500);
-
-  while(Serial.available() > 0){
-    /* Read in a line and execute it. */
-    read_length = Serial.readBytesUntil('\n', line_buffer, 256);
-    if(read_length > 0)
-    {
-      scpi_execute_command(&ctx, line_buffer, read_length);
-    }
-  }
-
   relay_delayf = millis();
-
   relay_delay  = relay_delayf - relay_delayi;
 
   // Wait about 100ms to allow inductors and capacitors
   // to charge. This will lower the "drive" of the buck converter.
-  if(relay_delay >= 100){
-    if(CH1EN)
-      digitalWrite(CH1Relay, LOW);
-    if(CH2EN)
-      digitalWrite(CH2Relay, LOW);
+  if(relay_delay >= 100 && RelayInit == 0){
+    RelayInit = 1;
+
+    if(CH1EN){
+      digitalWrite(CH1RelayLoad, LOW);
+      digitalWrite(CH1RelayVolt, LOW);
+    }
+
+    if(CH2EN){
+      digitalWrite(CH2RelayLoad, LOW);
+      digitalWrite(CH2RelayVolt, LOW);
+    }
+  }
+
+  /* if a complete SCPI command is in the buffer, execute the command and reset the buffer */
+  if (serial_input_usb_complete == true) {
+	  scpi_execute_command(&ctx, serial_input_usb.c_str(), serial_input_usb.length() - 1);
+	  serial_input_usb = "";
+	  serial_input_usb_complete = false;
+  }
+
+  if (serial_input_bt_complete == true) {
+	  scpi_execute_command(&ctx, serial_input_bt.c_str(), serial_input_bt.length() - 1);
+	  serial_input_bt = "";
+	  serial_input_bt_complete = false;
   }
 
   //Used for LCD Display and Keypad Readback
   ReadVoltage();
   ReadCurrent();
+  AdjustVoltCurr();
+  RelayUpdate();
   KeyPad();
   UpdateLCD();
-  detectShort();
 }
 
-
-/*
- * Respond to *IDN?
- */
-scpi_error_t identify(struct scpi_parser_context* context, struct scpi_token* command)
+/* runs in between every iteration of loop() */
+void serialEvent1()
 {
-  scpi_free_tokens(command);
+	/* if there is anything in the serial buffer, process it */
+	while (Serial1.available()) {
+		/* add the new character to the SCPI command buffer */
+		char new_character  = (char) Serial1.read();
+		serial_input_usb += new_character;
 
-  Serial.println("PC Controlled DC Power Supply V1.0");
-  return SCPI_SUCCESS;
+		/* if a newline character is read, assume complete command and break */
+		if (new_character == '\n') {
+			serial_input_usb_complete = true;
+			break;
+		}
+	}
 }
 
-/**
- * Read the voltage on A0.
- */
-scpi_error_t get_voltage(struct scpi_parser_context* context, struct scpi_token* command)
+void serialEvent2()
 {
-  float voltage;
+	/* if there is anything in the serial buffer, process it */
+	while (Serial2.available()) {
+		/* add the new character to the SCPI command buffer */
+		char new_character  = (char) Serial2.read();
+		serial_input_bt += new_character;
 
-  voltage = analogRead(0) * 5.0f/1024;
-  Serial.println(voltage,4);
-
-  scpi_free_tokens(command);
-  return SCPI_SUCCESS;
+		/* if a newline character is read, assume complete command and break */
+		if (new_character == '\n') {
+			serial_input_bt_complete = true;
+			break;
+		}
+	}
 }
 
-/**
- * Read the voltage on A1.
- */
-scpi_error_t get_voltage_2(struct scpi_parser_context* context, struct scpi_token* command)
+/* returns an identification string for this device */
+scpi_error_t identify(struct scpi_parser_context *context, struct scpi_token *command)
 {
-  float voltage;
+	Serial.println("SCPI Configurable DC Power Supply V1.0");
 
-  voltage = analogRead(1) * 5.0f/1024;
-  Serial.println(voltage,4);
-
-  scpi_free_tokens(command);
-  return SCPI_SUCCESS;
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
 }
 
-/**
- * Read the voltage on A2.
- */
-scpi_error_t get_voltage_3(struct scpi_parser_context* context, struct scpi_token* command)
+/* returns the measured voltage of channel 1 */
+scpi_error_t get_voltage_ch1(struct scpi_parser_context *context, struct scpi_token *command)
 {
-  float voltage;
+	Serial.println(measured_voltage_ch1, 4);
 
-  voltage = analogRead(2) * 5.0f/1024;
-  Serial.println(voltage,4);
-
-  scpi_free_tokens(command);
-  return SCPI_SUCCESS;
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
 }
 
-/**
- * Set the voltage using PWM on pin 3.
- */
-scpi_error_t set_voltage(struct scpi_parser_context* context, struct scpi_token* command)
+/* returns the measured voltage of channel 2 */
+scpi_error_t get_voltage_ch2(struct scpi_parser_context *context, struct scpi_token *command)
 {
-  struct scpi_token* args;
-  struct scpi_numeric output_numeric;
-  unsigned char output_value;
+	Serial.println(measured_voltage_ch2, 4);
 
-  args = command;
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
 
-  while(args != NULL && args->type == 0)
-  {
-    args = args->next;
-  }
+/* returns the measured current of channel 1 */
+scpi_error_t get_current_ch1(struct scpi_parser_context *context, struct scpi_token *command)
+{
+	Serial.println(measured_current_ch1, 4);
 
-  output_numeric = scpi_parse_numeric(args->value, args->length, 0, 0, 5);
-  if(output_numeric.length == 0 ||
-    (output_numeric.length == 1 && output_numeric.unit[0] == 'V'))
-  {
-    output_value = (unsigned char)constrain(output_numeric.value / 5.0f * 256.0f, 0, 255);
-  }
-  else if(output_numeric.length == 2 &&
-    output_numeric.unit[0] == 'N' && output_numeric.unit[1] == 'T')
-  {
-    output_value = (unsigned char)constrain(output_numeric.value, 0, 255);
-  }
-  else
-  {
-    scpi_error error;
-    error.id = -200;
-    error.description = "Command error;Invalid unit";
-    error.length = 26;
-    Serial.print(output_numeric.length);
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
 
-    scpi_queue_error(&ctx, error);
+/* returns the measured current of channel 2 */
+scpi_error_t get_current_ch2(struct scpi_parser_context *context, struct scpi_token *command)
+{
+	Serial.println(measured_current_ch2, 4);
+
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
+
+/* returns the state of channel 1 */
+scpi_error_t get_status_ch1(struct scpi_parser_context *context, struct scpi_token *command)
+{
+    if (CH1EN)
+    {
+        Serial.println("true");
+    }
+    else
+    {
+        Serial.println("false");
+    }
+
     scpi_free_tokens(command);
     return SCPI_SUCCESS;
-  }
-
-  analogWrite(3, output_value);
-
-  scpi_free_tokens(command);
-
-  return SCPI_SUCCESS;
 }
 
-/**
- * Set the voltage using PWM on pin 5.
- */
-scpi_error_t set_voltage_2(struct scpi_parser_context* context, struct scpi_token* command)
+/* returns the state of channel 2 */
+scpi_error_t get_status_ch2(struct scpi_parser_context *context, struct scpi_token *command)
 {
-  struct scpi_token* args;
-  struct scpi_numeric output_numeric;
-  unsigned char output_value;
+    if (CH2EN)
+    {
+        Serial.println("true");
+    }
+    else
+    {
+        Serial.println("false");
+    }
 
-  args = command;
-
-  while(args != NULL && args->type == 0)
-  {
-    args = args->next;
-  }
-
-  output_numeric = scpi_parse_numeric(args->value, args->length, 0, 0, 5);
-  if(output_numeric.length == 0 ||
-    (output_numeric.length == 1 && output_numeric.unit[0] == 'V'))
-  {
-    output_value = (unsigned char)constrain(output_numeric.value / 5.0f * 256.0f, 0, 255);
-  }
-  else if(output_numeric.length == 2 &&
-    output_numeric.unit[0] == 'N' && output_numeric.unit[1] == 'T')
-  {
-    output_value = (unsigned char)constrain(output_numeric.value, 0, 255);
-  }
-  else
-  {
-    scpi_error error;
-    error.id = -200;
-    error.description = "Command error;Invalid unit";
-    error.length = 26;
-    Serial.print(output_numeric.length);
-
-    scpi_queue_error(&ctx, error);
     scpi_free_tokens(command);
     return SCPI_SUCCESS;
-  }
-
-  analogWrite(5, output_value);
-
-  scpi_free_tokens(command);
-
-  return SCPI_SUCCESS;
 }
 
-scpi_error_t shutdown_system(struct scpi_parser_context* context, struct scpi_token* command)
+/* sets the target voltage for channel 1 */
+scpi_error_t set_voltage_ch1(struct scpi_parser_context *context, struct scpi_token *command)
 {
-  scpi_free_tokens(command);
+	/* declaration of parsed numeric input */
+	struct scpi_numeric output_numeric;
 
-  shutdown_cmd = 1;
+	/* loop through token list until a numeric result is found */
+	while (command != NULL && command->type == 0)
+	{
+		command = command->next;
+	}
 
-  return SCPI_SUCCESS;
+	/* parse the numeric result into an scpi_numeric struct */
+	output_numeric = scpi_parse_numeric(command->value, command->length, 0, 0, 5);
+	/* if the numeric result has no unit, or the unit is specified as V, use the value */
+	if (output_numeric.length == 0 || (output_numeric.length == 1 && output_numeric.unit[0] == 'V'))
+	{
+		/* restrict the voltage between 2V and 14V */
+		target_voltage_ch1 = (unsigned char) constrain(output_numeric.value, 2.f, 14.f);
+	}
+	else // if the numeric result has the wrong unit
+	{
+		/* generate an internal error for an invalid unit */
+		scpi_error error;
+		error.id = -3;
+		error.description = "Invalid Unit";
+		error.length = 12;
+
+		/* place the error on the error stack */
+		scpi_queue_error(&ctx, error);
+	}
+
+	/* consume the SCPI command and exit the function */
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
 }
 
-float readAref (void) {
-  float volt;
+/* sets the target voltage for channel 2 */
+scpi_error_t set_voltage_ch2(struct scpi_parser_context *context, struct scpi_token *command)
+{
+	/* declaration of parsed numeric input */
+	struct scpi_numeric output_numeric;
+
+	/* loop through token list until a numeric result is found */
+	while (command != NULL && command->type == 0)
+	{
+		command = command->next;
+	}
+
+	/* parse the numeric result into an scpi_numeric struct */
+	output_numeric = scpi_parse_numeric(command->value, command->length, 0, 0, 5);
+	/* if the numeric result has no unit, or the unit is specified as V, use the value */
+	if (output_numeric.length == 0 || (output_numeric.length == 1 && output_numeric.unit[0] == 'V'))
+	{
+		/* restrict the voltage between 2V and 14V */
+		target_voltage_ch2 = (unsigned char) constrain(output_numeric.value, 2.f, 14.f);
+	}
+	else // if the numeric result has the wrong unit
+	{
+		/* generate an internal error for an invalid unit */
+		scpi_error error;
+		error.id = -3;
+		error.description = "Invalid Unit";
+		error.length = 12;
+
+		/* place the error on the error stack */
+		scpi_queue_error(&ctx, error);
+	}
+
+	/* consume the SCPI command and exit the function */
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
+
+/* sets the target current for channel 1 */
+scpi_error_t set_current_ch1(struct scpi_parser_context *context, struct scpi_token *command)
+{
+	/* declaration of parsed numeric input */
+	struct scpi_numeric output_numeric;
+
+	/* loop through token list until a numeric result is found */
+	while (command != NULL && command->type == 0)
+	{
+		command = command->next;
+	}
+
+	/* parse the numeric result into an scpi_numeric struct */
+	output_numeric = scpi_parse_numeric(command->value, command->length, 0, 0, 5);
+	/* if the numeric result has no unit, or the unit is specified as V, use the value */
+	if (output_numeric.length == 0 || (output_numeric.length == 1 && output_numeric.unit[0] == 'A'))
+	{
+		/* restrict the current between 0A and 1.5A */
+		target_voltage_ch1 = (unsigned char) constrain(output_numeric.value, 0.f, 1.5f);
+	}
+	else // if the numeric result has the wrong unit
+	{
+		/* generate an internal error for an invalid unit */
+		scpi_error error;
+		error.id = -3;
+		error.description = "Invalid Unit";
+		error.length = 12;
+
+		/* place the error on the error stack */
+		scpi_queue_error(&ctx, error);
+	}
+
+	/* consume the SCPI command and exit the function */
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
+
+/* sets the target current for channel 1 */
+scpi_error_t set_current_ch2(struct scpi_parser_context *context, struct scpi_token *command)
+{
+	/* declaration of parsed numeric input */
+	struct scpi_numeric output_numeric;
+
+	/* loop through token list until a numeric result is found */
+	while (command != NULL && command->type == 0)
+	{
+		command = command->next;
+	}
+
+	/* parse the numeric result into an scpi_numeric struct */
+	output_numeric = scpi_parse_numeric(command->value, command->length, 0, 0, 5);
+	/* if the numeric result has no unit, or the unit is specified as V, use the value */
+	if (output_numeric.length == 0 || (output_numeric.length == 1 && output_numeric.unit[0] == 'A'))
+	{
+		/* restrict the current between 0A and 1.5A */
+		target_voltage_ch2 = (unsigned char) constrain(output_numeric.value, 0.f, 1.5f);
+	}
+	else // if the numeric result has the wrong unit
+	{
+		/* generate an internal error for an invalid unit */
+		scpi_error error;
+		error.id = -3;
+		error.description = "Invalid Unit";
+		error.length = 12;
+
+		/* place the error on the error stack */
+		scpi_queue_error(&ctx, error);
+	}
+
+	/* consume the SCPI command and exit the function */
+	scpi_free_tokens(command);
+	return SCPI_SUCCESS;
+}
+
+//float readAref (void) {
+//  float volt;
 /*
 #if defined (__AVR_ATmega8__)
 #elif defined (__AVR_ATmega168__)
@@ -356,7 +515,7 @@ float readAref (void) {
 #elif defined (__AVR_ATmega168P__)
 #elif defined (__AVR_ATmega328__)
 #elif defined (__AVR_ATmega328P__)*/
-
+/*
   // set reference to AREF, and mux to read the internal 1.1V
   // REFS1 = 0, REFS0 = 0, MUX3..0 = 1110
   ADMUX = _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
@@ -386,17 +545,14 @@ float readAref (void) {
 
 
   // Try to return to normal.
-  analogReference(EXTERNAL);
-  analogRead(A0);            // the mux is set, throw away ADC value
-  delay(20);                 // wait for voltages to become stable
+//  analogReference(EXTERNAL);
+//  analogRead(A0);            // the mux is set, throw away ADC value
+//  delay(20);                 // wait for voltages to become stable
 
-  return volt;
-}
+//  return volt;
+//}*/
 
-/***********************************************
- *  Function: KeyPad()
- *  Description: Give an input
- ************************************************/
+
 void KeyPad(){
   //Loop through the columns
   currPress = 0;
@@ -459,8 +615,8 @@ void KeyPad(){
 
 /***********************************************
  *  Function: printKeyPad()
- *  Description: Convert keypad presses to system
- *  setting commands.
+ *  Description: Convert keypad presses to SCPI
+ *  commands.
  ************************************************/
 void printKeyPad(char k){
 
@@ -470,10 +626,23 @@ void printKeyPad(char k){
   }else if(k == 'N'){
     Serial.println("Key: Channel Enable/Disable");
 
-    if(setChannel == 1)
-      setCommand = "ENABLE";
-    else
-      setCommand = "ENABLE1"
+    if(setChannel == 1){
+        if(CH1EN)
+          CH1EN = 0;
+        else
+          CH1EN = 1;
+    }else{
+        if(CH2EN)
+          CH2EN = 0;
+        else
+          CH2EN = 1;
+    }
+
+    //Clear any error reports from over current draw
+    ErrorReport = "";
+    ErrorReport2 = "";
+    setValue = "";
+    keypadDone = 1;
 
   }else if(k == 'V'){
     Serial.println("Key: Set Voltage");
@@ -496,6 +665,7 @@ void printKeyPad(char k){
 
     setValue = "";  //Clear the command string
     keypadDone = 1;
+    SetVoltCurr();
   }else{
     // Only use 4 keys, such as 12.50
     if(setValue.length() < 4)
@@ -524,23 +694,17 @@ void sendKeypadValue(){
         /*********************/
         /* SET COMMAND VALUE */
         /*********************/
-        if(setChannel == 0){
-
+        if(setChannel == 1){
           if(setCommand == "VOLTAGE")
             CH1VoltSet = setValue.toFloat();
           else if(setCommand == "CURRENT")
             CH1CurrSet = setValue.toFloat();
-          else if(setCommand == "ENABLE")
-            CH1EN != CH1EN;
 
-        }else if(setChannel == 1){
-
-          if(setCommand == "VOLTAGE")
+        }else if(setChannel == 2){
+          if(setCommand == "VOLTAGE1")
             CH1VoltSet = setValue.toFloat();
-          else if(setCommand == "CURRENT")
+          else if(setCommand == "CURRENT1")
             CH1CurrSet = setValue.toFloat();
-          else if(setCommand == "ENABLE")
-            CH2EN != CH2EN;
         }
 
       }
@@ -551,8 +715,8 @@ void sendKeypadValue(){
 /***********************************************
  *  Function: checkRangeCommand()
  *  Description: Check if the voltage and current
- *  are within specification of the "set command".
- *  Where: Voltage [0, 14.0]V, Current [0, 1.5]A
+ *  are within specification.
+ *  Where: Voltage [0, 14.0], Current [0, 1.5]
  ************************************************/
 int checkRangeCommand(){
   if(setValue == "")
@@ -587,55 +751,66 @@ int checkRangeCommand(){
  *  well as what the channels read.
  ************************************************/
 void UpdateLCD(){
-  String lcdText = "";
   lcd_delayi = millis();
 
   //calculate the time diff. from last LCD update
   //lcd_delayi is a larger number than lcd_delayf
   lcd_delay = lcd_delayi - lcd_delayf;
 
-  if(lcd_delay > 10){
-    clearLCD();
+  if(lcd_delay > 300){
 
-    if(keypadDone == 0){
-
-      //Show which option
+    if(ErrorReport != "" && lcd_delay > 500){
+      clearLCD();
       lcd.setCursor(0, 0);
-      lcd.print(setCommand);
-      lcd.setCursor(7, 0);
-      lcd.print(":");
-      //display pressed value
-      lcd.setCursor(8, 0);
-      lcd.print(setValue);
-
-    }else{
-      lcdText = String(lcd_delay);
-
-      lcd.setCursor(0, 0);
-      lcd.print("C1");
-      lcd.setCursor(3, 0);
-      lcd.print("V:");
-      lcd.setCursor(5,0);
-      lcd.print(CH1VoltRead, 1);//Display CH1 voltage
-
-      lcd.setCursor(10, 0);
-      lcd.print("I:");
-      lcd.setCursor(12, 0);
-      lcd.print(CH1CurrRead, 1); //Display CH1 Current(I)
-
+      lcd.print(ErrorReport);
       lcd.setCursor(0, 1);
-      lcd.print("C2");
-      lcd.setCursor(3, 1);
-      lcd.print("V:");
-      lcd.setCursor(5,1);
-      lcd.print(CH2VoltRead, 1);//Display CH2 voltage
-
-      lcd.setCursor(10, 1);
-      lcd.print("I:");
-      lcd.setCursor(12, 1);
-      lcd.print(CH2CurrRead, 1); //Display CH2 Current(I)
+      lcd.print(ErrorReport2);
 
       lcd_delayf = millis();
+    }else{
+
+        if(keypadDone == 0){
+          clearLCD();
+
+          //Show which option
+          lcd.setCursor(0, 0);
+          lcd.print(setCommand);
+          lcd.setCursor(7, 0);
+          lcd.print(":");
+          //display pressed value
+          lcd.setCursor(8, 0);
+          lcd.print(setValue);
+
+          lcd_delayf = millis();
+        }else if(lcd_delay > 500){
+          clearLCD();
+
+          lcd.setCursor(0, 0);
+          lcd.print("C1");
+          lcd.setCursor(3, 0);
+          lcd.print("V:");
+          lcd.setCursor(5,0);
+          lcd.print(CH1VoltRead, 1);//Display CH1 voltage
+
+          lcd.setCursor(10, 0);
+          lcd.print("I:");
+          lcd.setCursor(12, 0);
+          lcd.print(CH1CurrRead, 2); //Display CH1 Current(I)
+
+          lcd.setCursor(0, 1);
+          lcd.print("C2");
+          lcd.setCursor(3, 1);
+          lcd.print("V:");
+          lcd.setCursor(5,1);
+          lcd.print(CH2VoltRead, 1);//Display CH2 voltage
+
+          lcd.setCursor(10, 1);
+          lcd.print("I:");
+          lcd.setCursor(12, 1);
+          lcd.print(CH2CurrRead, 2); //Display CH2 Current(I)
+
+          lcd_delayf = millis();
+        }
     }
   }
 }
@@ -667,29 +842,36 @@ void clearLCD(){
 void ReadVoltage(){
   float v1  = 0.0, v2 = 0.0;
 
-  for(int i = 0; i < 10; i++){
-    v1 += analogRead(CH1VoltPin);
-    //v2 += analogRead(CH2VoltPin);
-  }
+  if(CH1EN){
+    for(int i = 0; i < 10; i++){
+      v1 += analogRead(CH1VoltPin);
+    }
 
-  v1 /= 10; //Get the average of 10 reads
-  v1 /= 1023; //Convert to float
-  v1 *= 5; //Reading with a 5V reference
-  v1 *= 7.263/2.18; //Voltage divider resistors
+    v1 /= 10; //Get the average of 10 reads
+    v1 /= 1023; //Convert to float
+    v1 *= 5; //Reading with a 5V reference
+    v1 *= 3.55; //Voltage divider resistors
+    v1 *= 0.99; //Scale the voltage read to fix output
 
-  for(int i = 0; i < 10; i++){
-    v2 += analogRead(CH1VoltPin);
-    //v2 += analogRead(CH2VoltPin);
-  }
+    CH1VoltRead = v1;
+  }else
+    CH1VoltRead = 0.0;
 
-  v2 /= 10; //Get the average of 10 reads
-  v2 /= 1023; //Convert to float
-  v2 *= 5; //Reading with a 5V reference
-  v2 *= 7.263/2.18; //Voltage divider resistors
+  if(CH2EN){
+    for(int i = 0; i < 10; i++){
+      v2 += analogRead(CH2VoltPin);
+    }
+    v2 /= 10; //Get the average of 10 reads
+    v2 /= 1023; //Convert to float
+    v2 *= 5; //Reading with a 5V reference
+    v2 *= 3.55; //Voltage divider resistors
+    v2 *= 0.99; //Scale the voltage read to fix output
 
-  //Update Voltage Reading Output
-  CH1VoltRead = v1;
-  CH2VoltRead = v2;
+    //Update Voltage Reading Output
+    CH2VoltRead = v2;
+  }else
+    CH2VoltRead = 0.0;
+
 }
 
 /***********************************************
@@ -702,68 +884,116 @@ void ReadVoltage(){
 void ReadCurrent(){
   float c1  = 0.0, c2 = 0.0;
 
-  for(int i = 0; i < 10; i++){
-    c1 += analogRead(CH1CurrPin);
+  if(CH1EN){
+    for(int i = 0; i < 10; i++){
+      c1 += analogRead(CH1CurrPin);
+    }
+
+    //c1 = analogRead(CH1CurrPin);
+    c1 /= 10; //Get the average of 10 reads
+    c1 /= 1023; //Convert from Analog
+    c1 *= 5; //Reading with a 5V reference
+    c1 *= 1.845; ///= 0.542; // *= (1000 + 860)/1000; //Voltage Divider
+    c1 /= 5.3;//scale down the 50V/V Gain
+
+    CH1CurrRead = c1;
+  }else
+    CH1CurrRead = 0.0;
+
+  if(CH2EN){
+    for(int i = 0; i < 10; i++){
+      c2 += analogRead(CH2CurrPin);
+    }
+    c2 /= 10; //Get the average of 10 reads
+    c2 /= 1023; //Convert from Analog
+    c2 *= 5; //Reading with a 5V reference
+    c2 *= 1.845; ///= 0.542; //*= (1000 + 860)/1000; //Voltage Divider
+    c2 /= 5.3;//scale down the 50V/V Gain
+
+    CH2CurrRead = c2;
+  }else
+    CH2CurrRead = 0.0;
+
+  if( ( c1 >= 1.56 || c1 >  CH1CurrSet) && CH1EN == 1){
+    CH1EN = 0;
+    digitalWrite(CH1RelayLoad, LOW);
+    digitalWrite(CH1RelayVolt, LOW);
+
+    ErrorReport = "Max Current " + String(c1);
+    ErrorReport2 = "Channel 1";
   }
 
-  c1 /= 10; //Get the average of 10 reads
-  c1 /= 1023; //Convert from Analog
-  c1 *= 5; //Reading with a 5V reference
-  c1 *= (1000 + 860)/1000; //Voltage Divider
-  c1 /= 5;//scale down the 50V/V Gain
+  if( ( c2 >= 1.56 || c2 > CH2CurrSet) && CH2EN == 1){
+    CH2EN = 0;
+    digitalWrite(CH2RelayLoad, LOW);
+    digitalWrite(CH2RelayVolt, LOW);
 
-  for(int i = 0; i < 10; i++){
-    c2 += analogRead(CH1CurrPin);
+    ErrorReport = "Max Current "+String(c2);
+    ErrorReport2 = "Channel 2";
   }
-
-  c2 /= 10; //Get the average of 10 reads
-  c2 /= 1023; //Convert from Analog
-  c2 *= 5; //Reading with a 5V reference
-  c2 *= (1000 + 860)/1000; //Voltage Divider
-  c2 /= 5;//scale down the 50V/V Gain
-
-  CH1CurrRead = c1;
-  CH2CurrRead = c2;
 }
 
-/*
-Vtarget = Vold(Itarget/Iold)
-if =1, then no adj.
-
-*/
-/***********************************************
- *  Function: targetVoltage()
- *  Description:  If the voltage goes above or below
- *  the target voltage, then adjust the PWM.
- ************************************************/
-void targetVoltage(){
-
-}
-
-/***********************************************
- *  Function: targetCurrent()
- *  Description: If the current goes above or below
- *  the target current, then adjust the PWM.
- ************************************************/
-void targetCurrent(){
-
-}
-
-/***********************************************
- *  Function: detectShort()
- *  Description: If the current goes over 1.5A then
- *  the output of the channel needs to be opened.
- *  If the current does exceed 1.5A by 100mA, then
- *  send a signal to relay to open the circuit.
- ************************************************/
-void  detectShort(){
-  if(CH1CurrRead >= 1.6){
-    /*RELAY CUTOFF*/
-    digitalWrite(CH1Relay, HIGH);
+void RelayUpdate(){
+  if(CH1EN){
+    digitalWrite(CH1RelayLoad, HIGH);
+    digitalWrite(CH1RelayVolt, HIGH);
+  }else{
+    digitalWrite(CH1RelayLoad, LOW);
+    digitalWrite(CH1RelayVolt, LOW);
   }
 
-  if(CH2CurrRead >= 1.6){
-    /*RELAY CUTOFF*/
-    digitalWrite(CH2Relay, HIGH);
+  if(CH2EN){
+    digitalWrite(CH2RelayLoad, HIGH);
+    digitalWrite(CH2RelayVolt, HIGH);
+  }else{
+    digitalWrite(CH2RelayLoad, LOW);
+    digitalWrite(CH2RelayVolt, LOW);
   }
+}
+
+void AdjustVoltCurr(){
+  float CH1VoltDiff = CH1VoltSet - CH1VoltRead;
+  float CH2VoltDiff = CH2VoltSet - CH1VoltRead;
+  float CH1CurrDiff = CH1CurrSet - CH1CurrRead;
+  float CH2CurrDiff = CH2CurrSet - CH2CurrRead;
+  ch1_pwm_delayi    = millis();
+  ch2_pwm_delayi    = millis();
+
+  ch1_pwm_delay = ch1_pwm_delayf - ch1_pwm_delayi;
+  ch2_pwm_delay = ch2_pwm_delayf - ch2_pwm_delayi;
+
+  if(CH1EN && ch1_pwm_delay >= 100){
+    if(CH1VoltDiff < -0.2 && CH1VoltPWM < 255)
+      CH1VoltPWM += 1; //CH1PWMScale += 0.01;
+    else if(CH1VoltDiff > 0.2 && CH1VoltPWM > 0)
+      CH1VoltPWM -= 1; //CH1PWMScale -= 0.01;
+
+    ch1_pwm_delayf = millis();
+    analogWrite(CH1SetPin, CH1VoltPWM);
+  }
+
+  if(CH2EN && ch2_pwm_delay >= 100){
+    if(CH2VoltDiff < -0.2 && CH2VoltPWM < 255)
+      CH2VoltPWM += 1;
+    else if(CH2VoltDiff > 0.2 && CH2VoltPWM > 0)
+      CH2VoltPWM -= 1;
+
+    ch1_pwm_delayf = millis();
+    analogWrite(CH2SetPin, CH2VoltPWM);
+  }
+}
+
+void SetVoltCurr(){
+  if(CH1EN){
+    CH1VoltPWM = (255/2)*CH1VoltSet/14;
+    analogWrite(CH1SetPin, CH1VoltPWM);
+  }else
+    analogWrite(CH1SetPin, 255);
+
+
+  if(CH2EN){
+    CH2VoltPWM = (255/2)*CH2VoltSet/14;
+    analogWrite(CH2SetPin, CH2VoltPWM);
+  }else
+    analogWrite(CH2SetPin, 255);
 }
