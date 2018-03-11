@@ -28,6 +28,9 @@ unsigned long lcd_delay = 0;
 unsigned long last_pressi = millis();
 unsigned long last_pressf = millis();
 unsigned long last_press  = 0;
+unsigned long relay_delayi = millis();
+unsigned long relay_delayf = millis();
+unsigned long relay_delay  = 0;
 
 String ErrorReport = "";    // Display any errors to LCD
 String CommandString = "";  // Used to hold the string to send to SCPI
@@ -36,10 +39,13 @@ String setValue      = ""; //Set the value of voltage or current
 int setChannel    = 1; //Select channel 1 or 2
 int keypadDone    = 1; //Tell the system if user is entering data 1:nothing 0:entering
 
+// The Pins used for the channels
 int CH1VoltPin    = A4;
 int CH1CurrPin    = A5;
 int CH2VoltPin    = A6;
 int CH2CurrPin    = A7;
+int CH1Relay      = 22;
+int CH2Relay      = 23;
 
 //These Values are to be read back to the user.
 float CH1VoltRead  = 0.0;
@@ -52,6 +58,8 @@ float CH1VoltSet  = 0.0;
 float CH1CurrSet  = 0.0;
 float CH2VoltSet  = 0.0;
 float CH2CurrSet  = 0.0;
+int   CH1EN       = 0; // 0 Disabled channel, 1 Enabled CHANNEL
+int   CH2EN       = 0;
 
 int row[4] = {A0, A1, A2, A3};
 int col[4] = {2, 3, 4, 5};
@@ -60,7 +68,7 @@ int col[4] = {2, 3, 4, 5};
 char key[4][4] = { {'1', '2', '3', 'C'},
                    {'4', '5', '6', 'V'},
                    {'7', '8', '9', 'I'},
-                   {'0', '.', 'R', 'E'} };
+                   {'0', '.', 'N', 'E'} };
 
 int shutdown_cmd = 0; //Command to break the main loop before turning off system.
 
@@ -107,19 +115,21 @@ void setup()
   scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE1?", 9, "VOLT1?", 6, get_voltage_2);
   scpi_register_command(measure, SCPI_CL_CHILD, "VOLTAGE2?", 9, "VOLT2?", 6, get_voltage_3);
 
-
-
-  /*
-   * Next, we set our outputs to some default value.
-   */
-  analogWrite(3, 0); //Are these Current and Voltage Limit Pins?
-  analogWrite(5, 0);
-
   Serial.begin(9600);
 
   //Setup LCD Screen
   lcd.begin(16, 2);
   lcd.setCursor(0, 1);
+
+  // Setup channel 1 and 2 Relays
+  pinMode(CH1Relay, OUTPUT);
+  pinMode(CH2Relay, OUTPUT);
+  relay_delayi = millis();  // begin counting
+  digitalWrite(CH1Relay, HIGH); //Start with relay opened
+  digitalWrite(CH2Relay, HIGH);
+
+  pinMode(A4, INPUT); //Voltage (V) Channel (1) Read
+  pinMode(A5, INPUT); //Current (I) Channel (1) Read
 
   //Set the row to INPUT with the internal pull-up resistors
   for(int i = 0; i < 4; i++)
@@ -137,7 +147,6 @@ void loop()
 
   //check for keypad presses
   KeyPad();
-
 
   //vRef  = readAref();
 
@@ -160,11 +169,25 @@ void loop()
     }
   }
 
+  relay_delayf = millis();
+
+  relay_delay  = relay_delayf - relay_delayi;
+
+  // Wait about 100ms to allow inductors and capacitors
+  // to charge. This will lower the "drive" of the buck converter.
+  if(relay_delay >= 100){
+    if(CH1EN)
+      digitalWrite(CH1Relay, LOW);
+    if(CH2EN)
+      digitalWrite(CH2Relay, LOW);
+  }
+
   //Used for LCD Display and Keypad Readback
   ReadVoltage();
   ReadCurrent();
   KeyPad();
   UpdateLCD();
+  detectShort();
 }
 
 
@@ -370,7 +393,10 @@ float readAref (void) {
   return volt;
 }
 
-
+/***********************************************
+ *  Function: KeyPad()
+ *  Description: Give an input
+ ************************************************/
 void KeyPad(){
   //Loop through the columns
   currPress = 0;
@@ -433,8 +459,8 @@ void KeyPad(){
 
 /***********************************************
  *  Function: printKeyPad()
- *  Description: Convert keypad presses to SCPI
- *  commands.
+ *  Description: Convert keypad presses to system
+ *  setting commands.
  ************************************************/
 void printKeyPad(char k){
 
@@ -443,6 +469,12 @@ void printKeyPad(char k){
     setCommand = "CHANNEL";
   }else if(k == 'N'){
     Serial.println("Key: Channel Enable/Disable");
+
+    if(setChannel == 1)
+      setCommand = "ENABLE";
+    else
+      setCommand = "ENABLE1"
+
   }else if(k == 'V'){
     Serial.println("Key: Set Voltage");
 
@@ -493,15 +525,22 @@ void sendKeypadValue(){
         /* SET COMMAND VALUE */
         /*********************/
         if(setChannel == 0){
+
           if(setCommand == "VOLTAGE")
             CH1VoltSet = setValue.toFloat();
           else if(setCommand == "CURRENT")
             CH1CurrSet = setValue.toFloat();
+          else if(setCommand == "ENABLE")
+            CH1EN != CH1EN;
+
         }else if(setChannel == 1){
+
           if(setCommand == "VOLTAGE")
             CH1VoltSet = setValue.toFloat();
           else if(setCommand == "CURRENT")
             CH1CurrSet = setValue.toFloat();
+          else if(setCommand == "ENABLE")
+            CH2EN != CH2EN;
         }
 
       }
@@ -512,8 +551,8 @@ void sendKeypadValue(){
 /***********************************************
  *  Function: checkRangeCommand()
  *  Description: Check if the voltage and current
- *  are within specification.
- *  Where: Voltage [0, 14.0], Current [0, 1.5]
+ *  are within specification of the "set command".
+ *  Where: Voltage [0, 14.0]V, Current [0, 1.5]A
  ************************************************/
 int checkRangeCommand(){
   if(setValue == "")
@@ -685,4 +724,46 @@ void ReadCurrent(){
 
   CH1CurrRead = c1;
   CH2CurrRead = c2;
+}
+
+/*
+Vtarget = Vold(Itarget/Iold)
+if =1, then no adj.
+
+*/
+/***********************************************
+ *  Function: targetVoltage()
+ *  Description:  If the voltage goes above or below
+ *  the target voltage, then adjust the PWM.
+ ************************************************/
+void targetVoltage(){
+
+}
+
+/***********************************************
+ *  Function: targetCurrent()
+ *  Description: If the current goes above or below
+ *  the target current, then adjust the PWM.
+ ************************************************/
+void targetCurrent(){
+
+}
+
+/***********************************************
+ *  Function: detectShort()
+ *  Description: If the current goes over 1.5A then
+ *  the output of the channel needs to be opened.
+ *  If the current does exceed 1.5A by 100mA, then
+ *  send a signal to relay to open the circuit.
+ ************************************************/
+void  detectShort(){
+  if(CH1CurrRead >= 1.6){
+    /*RELAY CUTOFF*/
+    digitalWrite(CH1Relay, HIGH);
+  }
+
+  if(CH2CurrRead >= 1.6){
+    /*RELAY CUTOFF*/
+    digitalWrite(CH2Relay, HIGH);
+  }
 }
